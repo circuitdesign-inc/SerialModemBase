@@ -1,2 +1,6 @@
 # SerialModemBase
-Common base class library for Circuit Design radio modems on Arduino
+本ライブラリは、サーキットデザイン社の無線モデム（MUシリーズ、MLRシリーズなど）を
+Arduinoで制御するための共通基底クラス SerialModemBase を提供します。
+
+低レイヤーのシリアル通信、コマンド応答の解析、タイムアウト管理、デバッグ出力などの共通処理を担い、
+各機種専用ドライバの土台として機能します。
