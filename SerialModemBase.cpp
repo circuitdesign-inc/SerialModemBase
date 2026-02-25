@@ -1,6 +1,6 @@
 /**
  * @file SerialModemBase.cpp
- * @brief Implementation of common modem logic.
+ * @brief Implementation of common modem logic with non-blocking architecture.
  * @copyright 2026 Circuit Design, Inc.
  */
 
@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 
-// Define static constexpr members to ensure storage is allocated
+// Define static constexpr members
 constexpr char SerialModemBase::CD_WRITE_OK_RESPONSE[];
 constexpr size_t SerialModemBase::CD_WRITE_OK_RESPONSE_LEN;
 constexpr char SerialModemBase::CD_VAL_ON[];
@@ -18,9 +18,14 @@ constexpr char SerialModemBase::CD_CMD_WRITE_SUFFIX[];
 SerialModemBase::SerialModemBase()
     : _uart(nullptr), _debugStream(nullptr),
       _rxIndex(0), _oneByteBuf(-1), _debugRxNewLine(true),
+      _state(State::Idle),
+      _queueHead(0), _queueTail(0),
+      _lastCmdComplete(true), _lastCmdResult(ModemError::Ok),
       _bTimeout(true), _startTime(0), _timeOutDuration(0)
 {
     memset(_rxBuffer, 0, RX_BUFFER_SIZE);
+    // Initialize current command with safe defaults
+    _currentCmd.type = CommandType::None;
 }
 
 void SerialModemBase::setDebugStream(Stream *debugStream)
@@ -34,106 +39,277 @@ void SerialModemBase::initSerial(Stream &stream)
     clearUnreadByte();
     _debugRxNewLine = true;
     _rxIndex = 0;
+    _state = State::Idle;
+    _queueHead = 0;
+    _queueTail = 0;
+    _lastCmdComplete = true;
 }
 
-// --- High-Level Transaction Helpers ---
+// --- Main State Machine ---
 
-ModemError SerialModemBase::waitForResponse(uint32_t timeoutMs)
+void SerialModemBase::update()
 {
-    // Reset timeout
-    startTimeout(timeoutMs);
-
-    SM_DEBUG_PRINTF("Wait: Waiting up to %lu ms...\n", timeoutMs);
-
-    while (!isTimeout())
+    // 1. Always Parse (Non-blocking)
+    // Process all available bytes to prevent hardware RX buffer overflow
+    while (_uart && (_uart->available() > 0 || _oneByteBuf != -1))
     {
-        ModemParseResult result = parse();
+        ModemParseResult parseResult = parse();
 
-        switch (result)
+        // Handle Async Data Reception immediately (can happen in any state)
+        if (parseResult == ModemParseResult::FinishedDrResponse)
         {
-        case ModemParseResult::Parsing:
-            // Continue waiting
-            delay(1);
-            break;
-
-        case ModemParseResult::FinishedCmdResponse:
-            SM_DEBUG_PRINTF("Wait: CMD Response: '%.*s'\n", _rxIndex, _rxBuffer);
-            return ModemError::Ok;
-
-        case ModemParseResult::FinishedDrResponse:
-            SM_DEBUG_PRINTLN("Wait: Intervening DR received. Handling callback...");
-            // Handle the asynchronous data packet
+            SM_DEBUG_PRINTF("Update: Async DR received. Len=%d\n", (int)_rxIndex);
             onRxDataReceived();
-            // Resume waiting for the original command response
-            SM_DEBUG_PRINTLN("Wait: Resume waiting for CMD...");
-            break;
+        }
 
-        case ModemParseResult::Garbage:
-        case ModemParseResult::Overflow:
-            SM_DEBUG_PRINTLN("Wait: Error (Garbage/Overflow).");
-            return ModemError::Fail;
+        // Handle command responses within the loop
+        if (_state != State::Idle &&
+            (parseResult == ModemParseResult::FinishedCmdResponse || parseResult == ModemParseResult::Overflow))
+        {
+            if (_state == State::WaitingSaveResponse)
+            {
+                if (_rxIndex == CD_WRITE_OK_RESPONSE_LEN &&
+                    strncmp(reinterpret_cast<char *>(_rxBuffer), CD_WRITE_OK_RESPONSE, CD_WRITE_OK_RESPONSE_LEN) == 0)
+                {
+                    SM_DEBUG_PRINTLN("Update: Save OK, waiting for final response...");
+                    startTimeout(_currentCmd.timeoutMs); // Reset timeout for final response
+                    _state = State::WaitingResponse;
+                }
+                else
+                {
+                    SM_DEBUG_PRINTLN("Update: Unexpected response while waiting for Save.");
+                    _lastCmdResult = ModemError::Fail;
+                    _lastCmdComplete = true;
+                    onCommandComplete(ModemError::Fail);
+                    _state = State::Idle;
+                }
+            }
+            else if (_state == State::WaitingResponse)
+            {
+                SM_DEBUG_PRINTF("Update: Cmd Response received: %s\n", (char *)_rxBuffer);
+                _lastCmdResult = ModemError::Ok;
+                _lastCmdComplete = true;
+                onCommandComplete(ModemError::Ok);
+                _state = State::Idle;
+            }
         }
     }
 
-    SM_DEBUG_PRINTLN("Wait: Timeout.");
-    return ModemError::Timeout;
+    // 2. Timeout Check (only if we didn't just finish a command)
+    if (_state != State::Idle && isTimeout())
+    {
+        SM_DEBUG_PRINTF("Update: Timeout in state %d\n", (int)_state);
+        _lastCmdResult = ModemError::Timeout;
+        _lastCmdComplete = true;
+        onCommandComplete(ModemError::Timeout);
+        _state = State::Idle;
+    }
+
+    // 3. Queue Handling
+    if (_state == State::Idle && !isQueueEmpty())
+    {
+        // Dequeue
+        _currentCmd = _commandQueue[_queueTail];
+        _queueTail = (_queueTail + 1) % QUEUE_SIZE;
+
+        // Mark sync state as busy
+        _lastCmdComplete = false;
+        _lastCmdResult = ModemError::Busy;
+
+        // Send Command
+        if (_currentCmd.type == CommandType::DataTx)
+        {
+            // Send Header
+            writeString(_currentCmd.cmdBuffer, true);
+
+            // Short delay to allow modem to process header
+            delay(10);
+
+            if (_currentCmd.pPayload && _currentCmd.payloadLen > 0)
+            {
+                writeData(_currentCmd.pPayload, _currentCmd.payloadLen);
+            }
+
+            // Append options/terminator
+            if (_currentCmd.suffix[0] != '\0')
+            {
+                writeString(_currentCmd.suffix, false);
+            }
+            writeString("\r\n", false);
+        }
+        else
+        {
+            // Simple Command
+            writeString(_currentCmd.cmdBuffer);
+        }
+
+        // Transition
+        if (_currentCmd.type == CommandType::NvmSave)
+        {
+            _state = State::WaitingSaveResponse;
+        }
+        else
+        {
+            _state = State::WaitingResponse;
+        }
+        startTimeout(_currentCmd.timeoutMs);
+    }
+}
+
+bool SerialModemBase::isIdle() const
+{
+    return (_state == State::Idle && isQueueEmpty());
+}
+
+// --- Command Queue Management ---
+
+bool SerialModemBase::isQueueFull() const
+{
+    return getQueueCount() >= (QUEUE_SIZE - 1);
+}
+
+bool SerialModemBase::isQueueEmpty() const
+{
+    return _queueHead == _queueTail;
+}
+
+uint8_t SerialModemBase::getQueueCount() const
+{
+    uint8_t h = _queueHead;
+    uint8_t t = _queueTail;
+
+    if (h >= t)
+        return (h - t);
+    return (uint8_t)(QUEUE_SIZE - t + h);
+}
+
+// --- Command Queueing ---
+
+ModemError SerialModemBase::enqueueInternal(const char *cmd, CommandType type, const uint8_t *payload, uint8_t len, const char *suffix, uint32_t timeoutMs)
+{
+    if (isQueueFull())
+    {
+        SM_DEBUG_PRINTF("Enqueue: Busy! Head=%d, Tail=%d, Count=%d\n", _queueHead, _queueTail, getQueueCount());
+        return ModemError::Busy;
+    }
+
+    _lastCmdComplete = false;
+    ModemCommand &qCmd = _commandQueue[_queueHead];
+    qCmd.type = type;
+    qCmd.timeoutMs = timeoutMs;
+    qCmd.pPayload = payload;
+    qCmd.payloadLen = len;
+
+    if (suffix)
+    {
+        strncpy(qCmd.suffix, suffix, sizeof(qCmd.suffix) - 1);
+        qCmd.suffix[sizeof(qCmd.suffix) - 1] = '\0';
+    }
+    else
+    {
+        qCmd.suffix[0] = '\0';
+    }
+
+    // Copy command string safely
+    strncpy(qCmd.cmdBuffer, cmd, sizeof(qCmd.cmdBuffer) - 1);
+    qCmd.cmdBuffer[sizeof(qCmd.cmdBuffer) - 1] = '\0';
+
+    _queueHead = (_queueHead + 1) % QUEUE_SIZE;
+    return ModemError::Ok;
+}
+
+ModemError SerialModemBase::enqueueCommand(const char *cmd, CommandType type, uint32_t timeoutMs)
+{
+    return enqueueInternal(cmd, type, nullptr, 0, nullptr, timeoutMs);
+}
+
+ModemError SerialModemBase::enqueueTxCommand(const char *cmdHeader, const uint8_t *payload, uint8_t len, const char *suffix, uint32_t timeoutMs)
+{
+    return enqueueInternal(cmdHeader, CommandType::DataTx, payload, len, suffix, timeoutMs);
+}
+
+// --- Synchronous Wrappers ---
+
+ModemError SerialModemBase::waitForSyncComplete(uint32_t timeoutMs)
+{
+    // Wait for the command that was just queued to complete
+    // This blocks the user code but keeps the update loop running
+    uint32_t start = millis();
+    while (!_lastCmdComplete)
+    {
+        update();
+        if (millis() - start > timeoutMs)
+        {
+            return ModemError::Timeout;
+        }
+        // Yield to allow other background tasks (ESP32 etc)
+        delay(0);
+    }
+    return _lastCmdResult;
+}
+
+// --- Lightweight String Helpers ---
+char *SerialModemBase::appendStr(char *dest, const char *src, const char *destEnd)
+{
+    while (*src && dest < destEnd - 1)
+    {
+        *dest++ = *src++;
+    }
+    *dest = '\0';
+    return dest;
+}
+
+char *SerialModemBase::appendHex2(char *dest, uint8_t val, const char *destEnd)
+{
+    static const char hexChars[] = "0123456789ABCDEF";
+    if (dest < destEnd - 2)
+    {
+        *dest++ = hexChars[val >> 4];
+        *dest++ = hexChars[val & 0x0F];
+        *dest = '\0';
+    }
+    return dest;
 }
 
 ModemError SerialModemBase::setByteValue(const char *cmd, uint8_t value, bool save, const char *respPrefix, size_t respLen)
 {
-    // 1. Send Command
     char buf[32];
-    snprintf(buf, sizeof(buf), "%s%02X%s\r\n", cmd, value, save ? CD_CMD_WRITE_SUFFIX : "");
-    writeString(buf);
+    char *p = appendStr(buf, buf, cmd);
+    p = appendHex2(buf, p, value);
+    if (save)
+        p = appendStr(buf, p, CD_CMD_WRITE_SUFFIX);
+    appendStr(buf, p, "\r\n");
 
-    // 2. Wait for Response
-    ModemError err = waitForResponse();
+    ModemError err = enqueueCommand(buf, save ? CommandType::NvmSave : CommandType::Simple);
+    if (err != ModemError::Ok)
+        return err;
 
-    // 3. Handle Write Response (*WR=PS) if saving
-    if (err == ModemError::Ok && save)
-    {
-        // Check if current buffer is *WR=PS
-        if (_rxIndex == CD_WRITE_OK_RESPONSE_LEN &&
-            strncmp(reinterpret_cast<char *>(_rxBuffer), CD_WRITE_OK_RESPONSE, CD_WRITE_OK_RESPONSE_LEN) == 0)
-        {
+    err = waitForSyncComplete(500); // 0.5s sync wait
 
-            // Wait for the actual value response that follows
-            err = waitForResponse();
-        }
-    }
-
-    // 4. Verify Final Response
-    uint8_t parsedValue = 0;
     if (err == ModemError::Ok)
     {
         uint32_t tmpVal = 0;
         err = parseResponseHex(_rxBuffer, _rxIndex, respPrefix, (uint8_t)(respLen - strlen(respPrefix)), &tmpVal);
-        if (err == ModemError::Ok)
+        if (err == ModemError::Ok && (uint8_t)tmpVal != value)
         {
-            parsedValue = static_cast<uint8_t>(tmpVal);
+            return ModemError::Fail;
         }
     }
-
-    // 5. Check if value matches
-    if (err == ModemError::Ok && parsedValue != value)
-    {
-        return ModemError::Fail;
-    }
-
     return err;
 }
 
 ModemError SerialModemBase::getByteValue(const char *cmd, uint8_t *pValue, const char *respPrefix, size_t respLen)
 {
-    // Send Command
     char buf[16];
-    snprintf(buf, sizeof(buf), "%s\r\n", cmd);
-    writeString(buf);
+    char *p = appendStr(buf, buf, cmd);
+    appendStr(buf, p, "\r\n");
 
-    // Wait
-    ModemError err = waitForResponse();
+    ModemError err = enqueueCommand(buf, CommandType::Simple);
+    if (err != ModemError::Ok)
+        return err;
 
-    // Parse
+    err = waitForSyncComplete(500);
+
     if (err == ModemError::Ok)
     {
         uint32_t tmpVal = 0;
@@ -148,33 +324,27 @@ ModemError SerialModemBase::getByteValue(const char *cmd, uint8_t *pValue, const
 
 ModemError SerialModemBase::setBoolValue(const char *baseCmd, bool enabled, bool save, const char *respPrefix)
 {
-    // 1. Send Command
     char buf[32];
-    snprintf(buf, sizeof(buf), "%s%s%s\r\n", baseCmd, enabled ? CD_VAL_ON : CD_VAL_OFF, save ? CD_CMD_WRITE_SUFFIX : "");
-    writeString(buf);
+    char *p = appendStr(buf, buf, baseCmd);
+    p = appendStr(buf, p, enabled ? CD_VAL_ON : CD_VAL_OFF);
+    if (save)
+        p = appendStr(buf, p, CD_CMD_WRITE_SUFFIX);
+    appendStr(buf, p, "\r\n");
 
-    // 2. Wait for Response
-    ModemError err = waitForResponse();
+    ModemError err = enqueueCommand(buf, save ? CommandType::NvmSave : CommandType::Simple);
+    if (err != ModemError::Ok)
+        return err;
 
-    // 3. Handle Write Response (*WR=PS) if saving
-    if (err == ModemError::Ok && save)
-    {
-        if (_rxIndex == CD_WRITE_OK_RESPONSE_LEN &&
-            strncmp(reinterpret_cast<char *>(_rxBuffer), CD_WRITE_OK_RESPONSE, CD_WRITE_OK_RESPONSE_LEN) == 0)
-        {
-            err = waitForResponse();
-        }
-    }
+    err = waitForSyncComplete(500);
 
-    // 4. Verify Final Response
     if (err == ModemError::Ok)
     {
+        // Verify response
         size_t prefixLen = strlen(respPrefix);
         if (_rxIndex < prefixLen + 2 || strncmp(reinterpret_cast<char *>(_rxBuffer), respPrefix, prefixLen) != 0)
         {
             return ModemError::Fail;
         }
-
         const char *valPtr = reinterpret_cast<char *>(_rxBuffer) + prefixLen;
         const char *expected = enabled ? CD_VAL_ON : CD_VAL_OFF;
         if (strncmp(valPtr, expected, 2) != 0)
@@ -188,10 +358,15 @@ ModemError SerialModemBase::setBoolValue(const char *baseCmd, bool enabled, bool
 ModemError SerialModemBase::getBoolValue(const char *cmd, bool *pValue, const char *respPrefix)
 {
     char buf[16];
-    snprintf(buf, sizeof(buf), "%s\r\n", cmd);
-    writeString(buf);
+    char *p = appendStr(buf, buf, cmd);
+    appendStr(buf, p, "\r\n");
 
-    ModemError err = waitForResponse();
+    ModemError err = enqueueCommand(buf, CommandType::Simple);
+    if (err != ModemError::Ok)
+        return err;
+
+    err = waitForSyncComplete(500);
+
     if (err == ModemError::Ok)
     {
         size_t prefixLen = strlen(respPrefix);
@@ -211,9 +386,11 @@ ModemError SerialModemBase::sendRawCommand(const char *command, char *responseBu
     if (!command || !responseBuffer)
         return ModemError::InvalidArg;
 
-    writeString(command);
+    ModemError err = enqueueCommand(command, CommandType::Simple, timeoutMs);
+    if (err != ModemError::Ok)
+        return err;
 
-    ModemError err = waitForResponse(timeoutMs);
+    err = waitForSyncComplete(timeoutMs + 100);
 
     if (err == ModemError::Ok)
     {
@@ -241,13 +418,9 @@ void SerialModemBase::writeString(const char *str, bool printPrefix)
 {
     if (!_uart)
         return;
-
     size_t len = strlen(str);
-
     if (printPrefix)
-    {
         SM_DEBUG_PRINT("TX: ");
-    }
     SM_DEBUG_WRITE(reinterpret_cast<const uint8_t *>(str), len);
     _uart->write(reinterpret_cast<const uint8_t *>(str), len);
     _debugRxNewLine = true;
@@ -261,10 +434,10 @@ void SerialModemBase::writeData(const uint8_t *data, size_t len)
     _uart->write(data, len);
 }
 
-uint8_t SerialModemBase::readByte()
+int SerialModemBase::readByte()
 {
     if (!_uart)
-        return 0;
+        return -1;
     int rcv_int = -1;
 
     if (_oneByteBuf != -1)
@@ -280,19 +453,17 @@ uint8_t SerialModemBase::readByte()
     if (rcv_int != -1)
     {
         uint8_t rcv = static_cast<uint8_t>(rcv_int);
+        /*
         if (_debugRxNewLine)
         {
             SM_DEBUG_PRINT("RX: ");
             _debugRxNewLine = false;
         }
+        // Debug output logic
         if (rcv >= 32 && rcv <= 126)
-        {
             SM_DEBUG_WRITE(rcv);
-        }
         else if (rcv == '\r')
-        {
             SM_DEBUG_WRITE("<CR>");
-        }
         else if (rcv == '\n')
         {
             SM_DEBUG_WRITE("<LF>\n");
@@ -304,9 +475,10 @@ uint8_t SerialModemBase::readByte()
             snprintf(buf, sizeof(buf), "<%02X>", rcv);
             SM_DEBUG_WRITE(buf);
         }
-        return rcv;
+        */
+        return rcv_int;
     }
-    return 0;
+    return -1;
 }
 
 void SerialModemBase::unreadByte(uint8_t c)
@@ -328,10 +500,7 @@ void SerialModemBase::flushGarbage(char keepChar)
     if (_oneByteBuf != -1)
     {
         if (_oneByteBuf == keepChar)
-        {
-            SM_DEBUG_WRITE(" Found keep char in buffer.\r\n");
             return;
-        }
         _oneByteBuf = -1;
     }
 
@@ -341,11 +510,10 @@ void SerialModemBase::flushGarbage(char keepChar)
         if (c == keepChar)
         {
             unreadByte(static_cast<uint8_t>(c));
-            SM_DEBUG_WRITE(" Found keep char.");
             break;
         }
     }
-    SM_DEBUG_WRITE(" Done.\r\n");
+    SM_DEBUG_PRINTLN(" Done.");
 }
 
 // --- Timeout Management ---
@@ -366,7 +534,7 @@ bool SerialModemBase::isTimeout()
     return _bTimeout;
 }
 
-// --- Parsing Helpers ---
+// --- Parsing Helpers (Static) ---
 
 bool SerialModemBase::parseHex(const uint8_t *pData, size_t len, uint32_t *pResult)
 {
@@ -417,12 +585,10 @@ ModemError SerialModemBase::parseResponseHex(const uint8_t *buffer, size_t lengt
     if (!buffer || !prefix || !pResult)
         return ModemError::InvalidArg;
     size_t prefixLen = strlen(prefix);
-
-    if (length != prefixLen + hexDigits)
+    if (length < prefixLen + hexDigits)
         return ModemError::Fail;
     if (strncmp(reinterpret_cast<const char *>(buffer), prefix, prefixLen) != 0)
         return ModemError::Fail;
-
     if (parseHex(buffer + prefixLen, hexDigits, pResult))
         return ModemError::Ok;
     return ModemError::Fail;
@@ -432,48 +598,21 @@ ModemError SerialModemBase::parseResponseDec(const uint8_t *buffer, size_t lengt
 {
     if (!buffer || !prefix || !pResult)
         return ModemError::InvalidArg;
-    size_t prefixLen = strlen(prefix);
 
-    if (length <= prefixLen + suffixLen)
+    size_t prefixLen = strlen(prefix);
+    // Check minimum length: prefix + at least 1 digit
+    if (length < prefixLen + 1)
         return ModemError::Fail;
+
     if (strncmp(reinterpret_cast<const char *>(buffer), prefix, prefixLen) != 0)
         return ModemError::Fail;
-    if (suffix && suffixLen > 0)
+
+    // Parse number part
+    uint32_t val = 0;
+    if (parseDec(buffer + prefixLen, length - prefixLen, &val))
     {
-        if (strncmp(reinterpret_cast<const char *>(buffer + length - suffixLen), suffix, suffixLen) != 0)
-            return ModemError::Fail;
+        *pResult = static_cast<int32_t>(val);
+        return ModemError::Ok;
     }
-
-    const uint8_t *numStart = buffer + prefixLen;
-    size_t numLen = length - prefixLen - suffixLen;
-    int32_t val = 0;
-    bool negative = false;
-    size_t i = 0;
-
-    if (numLen > 0 && numStart[0] == '-')
-    {
-        negative = true;
-        i++;
-    }
-    else if (numLen > 0 && numStart[0] == '+')
-    {
-        i++;
-    }
-
-    if (i >= numLen)
-        return ModemError::Fail;
-
-    for (; i < numLen; ++i)
-    {
-        uint8_t c = numStart[i];
-        if (c >= '0' && c <= '9')
-            val = val * 10 + (c - '0');
-        else
-            return ModemError::Fail;
-    }
-
-    if (negative)
-        val = -val;
-    *pResult = val;
-    return ModemError::Ok;
+    return ModemError::Fail;
 }

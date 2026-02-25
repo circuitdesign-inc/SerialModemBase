@@ -13,7 +13,7 @@
 enum class ModemError
 {
     Ok,             //!< No error
-    Busy,           //!< Driver is busy
+    Busy,           //!< Driver is busy (Queue full or operation in progress)
     InvalidArg,     //!< Invalid argument
     FailLbt,        //!< Carrier sense failed (LBT)
     Fail,           //!< General failure
@@ -33,18 +33,39 @@ enum class ModemParseResult
     FinishedDrResponse   //!< A data reception message (DR/DS) was received
 };
 
+/**
+ * @brief Command types for internal state machine processing.
+ */
+enum class CommandType
+{
+    None,
+    Simple,  //!< Standard command expecting a response (e.g., @CH01 -> *CH=01)
+    NvmSave, //!< Command with /W expecting *WR=PS then final response
+    DataTx   //!< Data transmission expecting *DT=XX, then potentially LBT result
+};
+
+/**
+ * @brief Structure to hold queued commands.
+ */
+struct ModemCommand
+{
+    CommandType type;        //!< Type of command
+    char cmdBuffer[48];      //!< Command string (header only for DataTx)
+    const uint8_t *pPayload; //!< Pointer to payload data (for DataTx)
+    uint8_t payloadLen;      //!< Length of payload
+    char suffix[48];         //!< Optional suffix for DataTx (e.g., routing options)
+    uint32_t timeoutMs;      //!< Timeout for this command
+};
+
 // --- Debug Configuration ---
-// To enable debug prints, define ENABLE_SERIAL_MODEM_DEBUG
+// To enable debug prints, define ENABLE_SERIAL_MODEM_DEBUG in your project
 // #define ENABLE_SERIAL_MODEM_DEBUG
 
 #ifdef ENABLE_SERIAL_MODEM_DEBUG
-
 #define SM_DEBUG_PRINT(...) this->dbgPrint(__VA_ARGS__)
 #define SM_DEBUG_PRINTLN(...) this->dbgPrintln(__VA_ARGS__)
 #define SM_DEBUG_PRINTF(...) this->dbgPrintf(__VA_ARGS__)
-
 #define SM_DEBUG_WRITE(...) this->dbgWrite(__VA_ARGS__)
-
 #else
 #define SM_DEBUG_PRINT(...) \
     do                      \
@@ -65,7 +86,7 @@ enum class ModemParseResult
 #endif
 
 /**
- * @brief Base class handling low-level serial I/O, debugging, and common transaction logic.
+ * @brief Base class handling low-level serial I/O, debugging, and async transaction logic.
  */
 class SerialModemBase
 {
@@ -79,6 +100,49 @@ public:
      */
     void setDebugStream(Stream *debugStream);
 
+    /**
+     * @brief Main processing loop. Must be called frequently.
+     * Handles command queue, transmission, and response parsing.
+     */
+    void update();
+
+    /**
+     * @brief Checks if the internal engine is currently idle (no command processing).
+     */
+    bool isIdle() const;
+
+    /**
+     * @brief Checks if the last processed command has finished.
+     * Useful for implementing synchronous wrappers.
+     */
+    bool isLastCommandComplete() const { return _lastCmdComplete; }
+
+    /**
+     * @brief Gets the result of the last processed command.
+     */
+    ModemError getLastCommandResult() const { return _lastCmdResult; }
+
+    /**
+     * @brief Accessor for the shared RX buffer.
+     */
+    const uint8_t *getRxBuffer() const { return _rxBuffer; }
+    uint16_t getRxIndex() const { return _rxIndex; }
+
+    /**
+     * @brief Checks if the command queue is full.
+     */
+    bool isQueueFull() const;
+
+    /**
+     * @brief Checks if the command queue is empty.
+     */
+    bool isQueueEmpty() const;
+
+    /**
+     * @brief Gets the number of commands currently in the queue.
+     */
+    uint8_t getQueueCount() const;
+
 protected:
 #ifdef ENABLE_SERIAL_MODEM_DEBUG
     template <typename... Args>
@@ -90,7 +154,6 @@ protected:
             _debugStream->print(args...);
         }
     }
-
     template <typename... Args>
     void dbgPrintln(Args... args)
     {
@@ -100,7 +163,6 @@ protected:
             _debugStream->println(args...);
         }
     }
-
     template <typename... Args>
     void dbgPrintf(Args... args)
     {
@@ -110,22 +172,16 @@ protected:
             _debugStream->printf(args...);
         }
     }
-
     template <typename... Args>
     void dbgWrite(Args... args)
     {
         if (_debugStream)
-        {
             _debugStream->write(args...);
-        }
     }
 #endif
 
-    // Common response for NVM Write Success in Circuit Design modems
     static constexpr char CD_WRITE_OK_RESPONSE[] = "*WR=PS";
     static constexpr size_t CD_WRITE_OK_RESPONSE_LEN = 6;
-
-    // Common constants for Circuit Design modems
     static constexpr char CD_VAL_ON[] = "ON";
     static constexpr char CD_VAL_OFF[] = "OF";
     static constexpr char CD_CMD_WRITE_SUFFIX[] = "/W";
@@ -137,17 +193,21 @@ protected:
      */
     void initSerial(Stream &stream);
 
-    // --- High-Level Transaction Helpers ---
+    // --- Command Queueing (For Derived Classes) ---
 
     /**
-     * @brief Waits for a command response, handling intervening Data Received events.
-     * * This function loops until parse() returns FinishedCmdResponse or timeout occurs.
-     * If FinishedDrResponse is returned during the wait, onRxDataReceived() is called
-     * and the loop continues (preserving the "async" nature of radio packets).
-     * * @param timeoutMs Max time to wait.
-     * @return ModemError::Ok on success, Timeout or Fail otherwise.
+     * @brief Enqueues a command for processing. Non-blocking.
+     * @return ModemError::Ok if queued, ModemError::Busy if queue is full.
      */
-    ModemError waitForResponse(uint32_t timeoutMs = 500);
+    ModemError enqueueCommand(const char *cmd, CommandType type, uint32_t timeoutMs = 1000);
+
+    /**
+     * @brief Enqueues a data transmission command with payload.
+     */
+    ModemError enqueueTxCommand(const char *cmdHeader, const uint8_t *payload, uint8_t len, const char *suffix = nullptr, uint32_t timeoutMs = 2000);
+
+    // --- Synchronous Wrappers (Implemented via update() loop) ---
+    // These replace the old blocking implementations but keep the same signature for API compatibility.
 
     /**
      * @brief Helper to set a 1-byte value (e.g., @CH0E) and verify the response.
@@ -204,10 +264,16 @@ protected:
      */
     ModemError sendRawCommand(const char *command, char *responseBuffer, size_t bufferSize, uint32_t timeoutMs);
 
+    /**
+     * @brief Helper to wait for the current command to finish (Pseudo-blocking).
+     * Calls update() internally.
+     */
+    ModemError waitForSyncComplete(uint32_t timeoutMs);
+
     // --- Low-Level I/O ---
     void writeString(const char *str, bool printPrefix = true);
     void writeData(const uint8_t *data, size_t len);
-    uint8_t readByte();
+    int readByte();
     void unreadByte(uint8_t c);
     void clearUnreadByte();
     void flushGarbage(char keepChar = '*');
@@ -217,11 +283,8 @@ protected:
     bool isTimeout();
 
     // --- Parsing Helpers ---
-    // Static helpers for parsing values
     static bool parseHex(const uint8_t *pData, size_t len, uint32_t *pResult);
     static bool parseDec(const uint8_t *pData, size_t len, uint32_t *pResult);
-
-    // Helpers that validate prefix/length from the internal buffer
     ModemError parseResponseHex(const uint8_t *buffer, size_t length, const char *prefix, uint8_t hexDigits, uint32_t *pResult);
     ModemError parseResponseDec(const uint8_t *buffer, size_t length, const char *prefix, const char *suffix, size_t suffixLen, int32_t *pResult);
 
@@ -232,35 +295,72 @@ protected:
      * @return Current status of parsing.
      */
     virtual ModemParseResult parse() = 0;
-
-    /**
-     * @brief Called when waitForResponse() encounters a Data Received event.
-     * Derived classes should typically invoke their registered user callback here.
-     */
     virtual void onRxDataReceived() = 0;
-
-    /**
-     * @brief Returns the log prefix for debug output (e.g., "[MLR]").
-     */
     virtual const char *getLogPrefix() const = 0;
 
+    /**
+     * @brief Optional hook called when a queued command finishes.
+     */
+    virtual void onCommandComplete(ModemError result) {}
+
 protected:
+    // --- String Helpers (with bounds checking) ---
+    static char *appendStr(char *dest, const char *src, const char *destEnd);
+    static char *appendHex2(char *dest, uint8_t val, const char *destEnd);
+
+    // Template helpers for automatic size deduction
+    template <size_t N>
+    static char *appendStr(char (&destBuf)[N], char *currentPtr, const char *src)
+    {
+        return appendStr(currentPtr, src, destBuf + N);
+    }
+    template <size_t N>
+    static char *appendHex2(char (&destBuf)[N], char *currentPtr, uint8_t val)
+    {
+        return appendHex2(currentPtr, val, destBuf + N);
+    }
+
     Stream *_uart = nullptr;
     Stream *_debugStream = nullptr;
 
-    // Shared Receive Buffer
-    // Size covers typical command responses and max payload frames (MU max ~300 bytes)
+    // Shared Receive Buffer (Unified)
     static constexpr size_t RX_BUFFER_SIZE = 300;
     uint8_t _rxBuffer[RX_BUFFER_SIZE];
     uint16_t _rxIndex = 0;
 
-    // Rx internal state
     int16_t _oneByteBuf = -1;
     bool _debugRxNewLine = true;
 
 private:
+    // --- Internal State Machine ---
+    enum class State
+    {
+        Idle,               //!< No command executing
+        Sending,            //!< Sending command string to UART
+        WaitingResponse,    //!< Waiting for primary response (e.g., *CH=01)
+        WaitingSaveResponse //!< Waiting for *WR=PS before final response
+    };
+    State _state = State::Idle;
+
+    // --- Command Queue ---
+    static constexpr uint8_t QUEUE_SIZE = 8;
+    ModemCommand _commandQueue[QUEUE_SIZE];
+    volatile uint8_t _queueHead = 0;
+    volatile uint8_t _queueTail = 0;
+
+    ModemCommand _currentCmd; // Currently executing command
+
+    // --- Sync/Result State ---
+    volatile bool _lastCmdComplete = true;
+    volatile ModemError _lastCmdResult = ModemError::Ok;
+
     // Timeout state
     bool _bTimeout = true;
     uint32_t _startTime = 0;
     uint32_t _timeOutDuration = 0;
+
+    /**
+     * @brief Internal helper to enqueue a command, avoiding code duplication.
+     */
+    ModemError enqueueInternal(const char *cmd, CommandType type, const uint8_t *payload, uint8_t len, const char *suffix, uint32_t timeoutMs);
 };
